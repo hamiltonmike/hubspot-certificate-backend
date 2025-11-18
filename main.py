@@ -109,6 +109,13 @@ SYSTEM_TYPE_ID = os.environ.get("SYSTEM_OBJECT_TYPE_ID", "2-2532422")
 AGREEMENT_TYPE_ID = os.environ.get("AGREEMENT_OBJECT_TYPE_ID", "2-16284422")
 GCS_BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME", "provident-certificates-temp")
 
+# Toggle for preview generation (default OFF to reduce timeout risk)
+CERTIFICATE_PREVIEW_ENABLED = os.environ.get(
+    'CERTIFICATE_PREVIEW_ENABLED',
+    'false'  # default: OFF
+).lower() == 'true'
+
+
 # ============================================================================
 # ASSOCIATION TYPE IDs - PORTAL SPECIFIC
 # ============================================================================
@@ -2006,6 +2013,14 @@ if __name__ == '__main__':
 # validation, device grouping, and field assembly
 # ============================================================
 
+# ============================================================
+# CERTIFICATE GENERATION V2 - WITH VALIDATION & ASSEMBLY
+# ============================================================
+# Added: 2025-11-18 (updated for body caching + optional preview)
+# Uses CertificateEngine for full HubSpot data fetching,
+# validation, device grouping, and field assembly
+# ============================================================
+
 @app.route('/api/generate-certificate-v2', methods=['POST', 'OPTIONS'])
 def generate_certificate_v2():
     """Generate certificate using full certificate engine"""
@@ -2018,10 +2033,20 @@ def generate_certificate_v2():
         return jsonify({"error": "Invalid signature"}), 401
     
     try:
-        data = request.get_json()
+        # Use cached body if validate_hubspot_signature() already read it
+        if hasattr(request, '_cached_data') and request._cached_data:
+            print("DEBUG Using cached request body for generate_certificate_v2", flush=True)
+            raw = request._cached_data
+            data = json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode('utf-8'))
+        else:
+            print("DEBUG Using request.get_json() for generate_certificate_v2", flush=True)
+            data = request.get_json()
         
         if not data:
             return jsonify({"error": "No data provided"}), 400
+
+        if isinstance(data, str):
+            data = json.loads(data)
         
         # Extract IDs (required)
         agreement_id = data.get('agreementId')
@@ -2038,6 +2063,7 @@ def generate_certificate_v2():
         # Validate required IDs
         if not all([agreement_id, system_id, site_id]):
             return jsonify({
+                "success": False,
                 "error": "Missing required IDs: agreementId, systemId, siteId"
             }), 400
         
@@ -2133,23 +2159,25 @@ def generate_certificate_v2():
         certificate_name = f"certificate-{site_name}-{certificate_id.replace('-', '_')}"
         hubspot_url = upload_pdf_to_hubspot(pdf_content, certificate_name)
         
-        # Generate preview image
+        # Generate preview image (OPTIONAL, controlled by CERTIFICATE_PREVIEW_ENABLED)
         preview_image_url = None
-        try:
-            print("DEBUG Starting preview generation...", flush=True)
-            temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
-            temp_pdf.write(pdf_content)
-            temp_pdf.close()
-            
-            image_bytes = convert_pdf_to_preview_image(temp_pdf.name)
-            preview_image_url = upload_preview_to_hubspot(image_bytes, certificate_id)
-            
-            if preview_image_url:
-                print(f"DEBUG ✅ Preview generated: {preview_image_url}", flush=True)
-        
-        except Exception as e:
-            app.logger.error(f"Preview generation failed: {str(e)}")
-            print(f"ERROR: Preview failed: {str(e)}", flush=True)
+        if CERTIFICATE_PREVIEW_ENABLED:
+            try:
+                print("DEBUG Starting preview generation (CERTIFICATE_PREVIEW_ENABLED = True)...", flush=True)
+                temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+                temp_pdf.write(pdf_content)
+                temp_pdf.close()
+                
+                image_bytes = convert_pdf_to_preview_image(temp_pdf.name)
+                preview_image_url = upload_preview_to_hubspot(image_bytes, certificate_id)
+                
+                if preview_image_url:
+                    print(f"DEBUG ✅ Preview generated: {preview_image_url}", flush=True)
+            except Exception as e:
+                app.logger.error(f"Preview generation failed: {str(e)}")
+                print(f"ERROR: Preview failed: {str(e)}", flush=True)
+        else:
+            print("DEBUG Preview generation skipped (CERTIFICATE_PREVIEW_ENABLED = False)", flush=True)
         
         # Return response
         primary_url = drive_url or gcs_url
