@@ -1,0 +1,15 @@
+.DS_Store
+.env
+.env.*
+env.yaml
+.env.deploy
+service-account-key.json
+current_config.yaml
+working_config.yaml
+test_cert.pdf
+*.pdf
+__pycache__/
+*.pyc
+*.backup
+*backup*
+*.broken
