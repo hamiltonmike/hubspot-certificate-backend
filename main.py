@@ -51,6 +51,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+from auth import require_internal_auth
 
 # Import our service modules
 from services.google_drive import (
@@ -166,6 +167,14 @@ TEST_EMAIL_OVERRIDE = "mike+testing@providentsecurity.ca"
 # Association Type IDs for requestors (PRODUCTION VALUES)
 AUTHORIZED_SITE_ADMIN_IDS = [263, 280]  # 🦉 SITE ADMIN (263), 🦉🦉 SITE SUPER ADMIN (280)
 AUTHORIZED_SIGNER_ID = 395  # Agreement Signer
+print("DEBUG AUTH CONFIG:", flush=True)
+print(f"  AUTHORIZED_SITE_ADMIN_IDS: {AUTHORIZED_SITE_ADMIN_IDS}", flush=True)
+print(f"  AUTHORIZED_SIGNER_ID: {AUTHORIZED_SIGNER_ID}", flush=True)
+
+# Optional: Ticket "Closed" stage ID (portal-specific)
+TICKET_CLOSED_STAGE_ID = os.environ.get('TICKET_CLOSED_STAGE_ID')
+print(f"  TICKET_CLOSED_STAGE_ID: {TICKET_CLOSED_STAGE_ID}", flush=True)
+
 
 # Initialize GCS client
 storage_client = storage.Client()
@@ -1255,6 +1264,25 @@ def get_broker_contacts():
             "error": "Internal server error"
         }), 500
 
+def normalize_type_ids(assoc_types, context_label=""):
+    """
+    Safely convert association typeId values to integers.
+    Adds detailed debug logging so we can see EXACTLY what HubSpot returns.
+    """
+    type_ids = []
+    for assoc_type in assoc_types:
+        raw = assoc_type.get('typeId')
+        if raw is None:
+            continue
+        try:
+            int_id = int(raw)
+            type_ids.append(int_id)
+        except (TypeError, ValueError):
+            print(f"DEBUG [{context_label}] Skipping non-int typeId value: {raw}", flush=True)
+
+    print(f"DEBUG [{context_label}] Normalized typeIds: {type_ids}", flush=True)
+    return type_ids
+
 
 @app.route('/api/get-requestors', methods=['POST', 'OPTIONS'])
 def get_requestors():
@@ -1326,19 +1354,60 @@ def get_requestors():
         if not site_assoc_data.get('results'):
             print("DEBUG No contacts associated with this site", flush=True)
         else:
-            for assoc in site_assoc_data['results']:
-                contact_id = assoc.get('toObjectId')
-                if not contact_id:
+            print(f"DEBUG Site association results count: {len(site_assoc_data.get('results', []))}", flush=True)
+
+        for assoc in site_assoc_data['results']:
+            contact_id = assoc.get('toObjectId')
+            if not contact_id:
+                continue
+
+            assoc_types = assoc.get('associationTypes', []) or []
+
+            # Log the raw structure for this association
+            print("DEBUG ---- SITE CONTACT ASSOCIATION ----", flush=True)
+            print(f"DEBUG contact_id: {contact_id}", flush=True)
+            print(f"DEBUG raw associationTypes: {assoc_types}", flush=True)
+
+            # Also log raw typeIds for visibility
+            raw_type_ids = [at.get('typeId') for at in assoc_types if at.get('typeId') is not None]
+            print(f"DEBUG raw typeIds (as returned): {raw_type_ids}", flush=True)
+
+            # Build a normalized map: id + category + label
+            normalized_entries = []
+            for at in assoc_types:
+                raw_id = at.get('typeId')
+                if raw_id is None:
+                    continue
+                try:
+                    int_id = int(raw_id)
+                except (ValueError, TypeError):
+                    print(f"DEBUG WARNING: Could not convert typeId '{raw_id}' to int", flush=True)
                     continue
 
-                assoc_types = assoc.get('associationTypes', [])
-                type_ids = [assoc_type.get('typeId') for assoc_type in assoc_types if assoc_type.get('typeId')]
+                normalized_entries.append({
+                    "id": int_id,
+                    "category": at.get("category"),
+                    "label": at.get("label"),
+                })
 
-                print(f"DEBUG Site contact {contact_id} type IDs: {type_ids}", flush=True)
+            # For debugging: show the normalized entries clearly
+            print(f"DEBUG normalized entries: {normalized_entries}", flush=True)
+            print(f"DEBUG AUTHORIZED_SITE_ADMIN_IDS (ints): {AUTHORIZED_SITE_ADMIN_IDS}", flush=True)
 
-                if any(type_id in AUTHORIZED_SITE_ADMIN_IDS for type_id in type_ids):
-                    site_admin_contact_ids.add(contact_id)
-                    print(f"DEBUG Contact {contact_id} authorized via Site Admin/Super Admin", flush=True)
+            # NEW: only treat as admin if the typeId matches AND it's USER_DEFINED
+            is_admin = any(
+                entry["id"] in AUTHORIZED_SITE_ADMIN_IDS and entry["category"] == "USER_DEFINED"
+                for entry in normalized_entries
+            )
+            print(f"DEBUG is_admin for contact {contact_id}: {is_admin}", flush=True)
+
+            if is_admin:
+                site_admin_contact_ids.add(contact_id)
+                print(f"DEBUG Contact {contact_id} ADDED to site_admin_contact_ids (USER_DEFINED admin match)", flush=True)
+            else:
+                print(f"DEBUG Contact {contact_id} is NOT an admin based on current IDs/categories", flush=True)
+
+
 
         # Step 2: Get Agreement Signer contacts
         signer_contact_ids = set()
@@ -1358,13 +1427,16 @@ def get_requestors():
                         continue
 
                     assoc_types = assoc.get('associationTypes', [])
-                    type_ids = [assoc_type.get('typeId') for assoc_type in assoc_types if assoc_type.get('typeId')]
 
-                    print(f"DEBUG Agreement contact {contact_id} type IDs: {type_ids}", flush=True)
+                    # Normalize typeIds to integers with detailed debug
+                    type_ids = normalize_type_ids(assoc_types, context_label=f"Agreement contact {contact_id}")
+
+                    print(f"DEBUG Agreement contact {contact_id} type IDs (normalized): {type_ids}", flush=True)
 
                     if any(type_id == AUTHORIZED_SIGNER_ID for type_id in type_ids):
                         signer_contact_ids.add(contact_id)
                         print(f"DEBUG Contact {contact_id} authorized via Agreement Signer", flush=True)
+
             else:
                 app.logger.error(f"Agreement associations error: {agreement_assoc_response.status_code} - {agreement_assoc_response.text}")
 
@@ -1637,7 +1709,6 @@ def generate_certificate():
             "error": "Internal server error"
         }), 500
 
-
 @app.route('/api/send-certificate-email', methods=['POST', 'OPTIONS'])
 def send_certificate_email():
     """
@@ -1873,14 +1944,28 @@ Customer Service Team"""
         # Update ticket properties
         if HUBSPOT_ACCESS_TOKEN:
             drive_link = data.get('driveUrl', certificate_pdf_url)
+
             # Use current time instead of midnight so each send creates a unique timestamp
-            
             current_time = datetime.now(timezone.utc)
+
+            # Build ticket subject: "Certificate Request | {Address}"
+            if site_address:
+                ticket_subject = f"Certificate Request | {site_address}"
+            else:
+                ticket_subject = "Certificate Request"
 
             ticket_update_props = {
                 'certificate_sent_date': str(int(current_time.timestamp() * 1000)),
-                'certificate_pdf_url': drive_link
+                'certificate_pdf_url': drive_link,
+                'subject': ticket_subject
             }
+
+            # Optionally set ticket "status" to Closed via hs_pipeline_stage
+            if TICKET_CLOSED_STAGE_ID:
+                ticket_update_props['hs_pipeline_stage'] = TICKET_CLOSED_STAGE_ID
+                print(f"DEBUG Setting ticket hs_pipeline_stage to CLOSED stage ID {TICKET_CLOSED_STAGE_ID}", flush=True)
+            else:
+                print("DEBUG TICKET_CLOSED_STAGE_ID not set; ticket status will not be auto-closed", flush=True)
 
             update_ticket_properties(HUBSPOT_ACCESS_TOKEN, ticket_id, ticket_update_props)
 
@@ -2000,6 +2085,7 @@ Customer Service Team"""
             "details": str(e)
         }), 500
 
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
@@ -2022,6 +2108,7 @@ if __name__ == '__main__':
 # ============================================================
 
 @app.route('/api/generate-certificate-v2', methods=['POST', 'OPTIONS'])
+# @require_internal_auth
 def generate_certificate_v2():
     """Generate certificate using full certificate engine"""
     print("DEBUG generate_certificate_v2() called", flush=True)
@@ -2047,6 +2134,11 @@ def generate_certificate_v2():
 
         if isinstance(data, str):
             data = json.loads(data)
+        
+        # ADDED: Remove internal auth key from data before processing
+        data.pop('_internal_api_key', None)
+        data.pop('internalApiKey', None)
+        print("DEBUG: Stripped internal API key from request data", flush=True)
         
         # Extract IDs (required)
         agreement_id = data.get('agreementId')
